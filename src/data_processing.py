@@ -5,86 +5,126 @@ from xml.etree import ElementTree
 from src.config import *
 
 def normalize_author(name):
-    name = name.lower()
+    if not name:
+        return ""
+    name = str(name).lower()
     name = re.sub(r'[^a-z\s]', '', name)
     return " ".join(name.split())
 
 def load_local_dataset(path="data/papers.csv"):
     try:
-        data = pd.read_csv(path).to_dict(orient="records")
+        df = pd.read_csv(path).fillna("")  # ✅ FIX: remove NaN
+
+        data = df.to_dict(orient="records")
+
         for p in data:
             authors = p.get("authors", "")
-            p["authors"] = ", ".join([normalize_author(a) for a in authors.split(",")])
-            p["source"] = p.get("source", "LocalDataset")
+            p["authors"] = ", ".join([
+                normalize_author(a) for a in str(authors).split(",")
+            ])
+
         return data
     except:
         return []
 
 def fetch_arxiv(query, limit):
-    url = f"http://export.arxiv.org/api/query?search_query=all:{query}&max_results={limit}"
-    root = ElementTree.fromstring(requests.get(url, timeout=10).content)
+    try:
+        url = f"http://export.arxiv.org/api/query?search_query=all:{query}&max_results={limit}"
+        response = requests.get(url, timeout=5)
 
-    papers = []
-    for e in root.findall("{http://www.w3.org/2005/Atom}entry"):
-        authors = [normalize_author(a.find("{http://www.w3.org/2005/Atom}name").text)
-                   for a in e.findall("{http://www.w3.org/2005/Atom}author")]
+        if response.status_code != 200:
+            return []
 
-        papers.append({
-            "source": "arXiv",
-            "title": e.find("{http://www.w3.org/2005/Atom}title").text.strip(),
-            "authors": ", ".join(authors),
-            "year": e.find("{http://www.w3.org/2005/Atom}published").text[:4],
-            "abstract": e.find("{http://www.w3.org/2005/Atom}summary").text.strip()
-        })
-    return papers
+        root = ElementTree.fromstring(response.content)
 
-def fetch_semantic(query, limit):
-    url = f"https://api.semanticscholar.org/graph/v1/paper/search?query={query}&limit={limit}&fields=title,authors,year,abstract"
-    data = requests.get(url, timeout=10).json()
+        papers = []
+        for e in root.findall("{http://www.w3.org/2005/Atom}entry"):
+            title = str(e.find("{http://www.w3.org/2005/Atom}title").text or "").strip()
 
-    papers = []
-    for p in data.get("data", []):
-        if p.get("abstract"):
-            authors = [normalize_author(a["name"]) for a in p.get("authors", [])]
+            authors = ", ".join([
+                str(a.find("{http://www.w3.org/2005/Atom}name").text or "")
+                for a in e.findall("{http://www.w3.org/2005/Atom}author")
+            ])
+
+            year = str(e.find("{http://www.w3.org/2005/Atom}published").text[:4] or "")
+
+            abstract = str(e.find("{http://www.w3.org/2005/Atom}summary").text or "").strip()
 
             papers.append({
-                "source": "SemanticScholar",
-                "title": p.get("title", ""),
-                "authors": ", ".join(authors),
-                "year": p.get("year", ""),
-                "abstract": p.get("abstract", "")
+                "source": "arXiv",
+                "title": title,
+                "authors": authors,
+                "year": year,
+                "abstract": abstract
             })
-    return papers
+
+        return papers
+    except:
+        return []
 
 def fetch_dblp(query):
-    url = f"https://dblp.org/search/publ/api?q={query}&format=xml"
-    root = ElementTree.fromstring(requests.get(url, timeout=10).content)
+    try:
+        url = f"https://dblp.org/search/publ/api?q={query}&format=xml"
+        response = requests.get(url, timeout=5)
 
-    return [{
-        "source": "DBLP",
-        "title": info.findtext("title", ""),
-        "authors": ", ".join([normalize_author(a.text) for a in info.findall("authors/author")]),
-        "year": info.findtext("year", ""),
-        "abstract": ""
-    } for info in [h.find("info") for h in root.findall(".//hit")]]
+        if response.status_code != 200:
+            return []
+
+        root = ElementTree.fromstring(response.content)
+
+        papers = []
+        for hit in root.findall(".//hit")[:10]:
+            info = hit.find("info")
+            if info is None:
+                continue
+
+            authors = [
+                str(a.text or "")
+                for a in info.findall("authors/author")
+                if a.text
+            ]
+
+            papers.append({
+                "source": "DBLP",
+                "title": str(info.findtext("title", "") or ""),
+                "authors": ", ".join(authors),
+                "year": str(info.findtext("year", "") or ""),
+                "abstract": ""
+            })
+
+        return papers
+    except:
+        return []
 
 def fetch_data(query):
     papers = []
-    per_source = max(1, MAX_RESULTS // 3)
 
+    # ✅ Load dataset (primary)
     if USE_LOCAL_DATASET:
         papers += load_local_dataset()
-    if USE_ARXIV:
-        papers += fetch_arxiv(query, per_source)
-    if USE_SEMANTIC:
-        papers += fetch_semantic(query, per_source)
-    if USE_DBLP:
-        papers += fetch_dblp(query)
 
-    return papers[:MAX_RESULTS]
+    # ✅ Add small API results
+    if query:
+        if USE_ARXIV:
+            papers += fetch_arxiv(query, 10)
+
+        if USE_DBLP:
+            papers += fetch_dblp(query)
+
+    # ✅ Remove duplicates
+    seen = set()
+    unique = []
+
+    for p in papers:
+        title = str(p.get("title", "") or "").strip()
+        if title and title not in seen:
+            seen.add(title)
+            unique.append(p)
+
+    return unique[:MAX_RESULTS]
 
 def preprocess(papers):
     return [
-        f"Title: {p['title']}\nAuthors: {p['authors']}\nYear: {p['year']}\nAbstract: {p['abstract']}"
+        str(p.get("title", "") or "") + " " + str(p.get("abstract", "") or "")
         for p in papers
     ]
