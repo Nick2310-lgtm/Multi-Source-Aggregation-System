@@ -3,7 +3,8 @@ import numpy as np
 
 def create_index(embeddings):
     embeddings = np.array(embeddings).astype("float32")
-    index = faiss.IndexFlatL2(embeddings.shape[1])
+    dim = embeddings.shape[1]
+    index = faiss.IndexFlatL2(dim)
     index.add(embeddings)
     return index
 
